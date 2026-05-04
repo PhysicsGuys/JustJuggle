@@ -1519,15 +1519,51 @@ async function simulateAnalysis(blob) {
   setStep(5, 'scoring confidence');
   await sleep(200);
 
-  const trackedPct   = cleaned.length / Math.max(totalFrames, 1);
-  const hasSignal    = smoothed.length > 5;
-  const velVariance  = vels.length > 0
-    ? vels.reduce((s, v) => s + v.vy * v.vy, 0) / vels.length : 0;
-  const signalQuality = Math.min(1, velVariance / 8000); // recalibrated for new MIN_VELOCITY scale
-
+  /*
+   * Confidence = how likely the detected contacts are real juggles.
+   * Three signals — all positively correlated with actual accuracy:
+   *
+   * A) RHYTHM (50%): real juggling is rhythmic. Measure the coefficient
+   *    of variation (stdDev / mean) of inter-contact gaps. Low CV = regular
+   *    = high confidence. Requires ≥2 contacts to compute.
+   *
+   * B) ACTIVE-WINDOW TRACKING (35%): what fraction of frames inside the
+   *    juggling window (first contact → last contact) had a ball detection?
+   *    This avoids penalizing correct detection for the pre/post-juggling
+   *    dead time where the ball isn't moving.
+   *
+   * C) CONTACT COUNT BONUS (15%): saturates at 5+ contacts. Prevents a
+   *    single accidental detection from scoring high.
+   */
   let confidence = 0;
-  if (hasSignal) {
-    confidence = (trackedPct * 0.5) + (signalQuality * 0.3) + (contacts.length > 0 ? 0.2 : 0);
+
+  if (contacts.length === 0) {
+    confidence = 0.05;
+  } else if (contacts.length === 1) {
+    confidence = 0.25;
+  } else {
+    // A) Rhythm regularity
+    const gaps = [];
+    for (let i = 1; i < contacts.length; i++)
+      gaps.push(contacts[i].time - contacts[i - 1].time);
+    const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    const stdGap  = Math.sqrt(gaps.reduce((s, g) => s + (g - meanGap) ** 2, 0) / gaps.length);
+    const cv      = meanGap > 0 ? stdGap / meanGap : 1;
+    // CV < 0.15 = very regular (metronome), CV > 0.6 = erratic
+    const rhythmScore = Math.max(0, Math.min(1, 1 - (cv / 0.6)));
+
+    // B) Tracking in active juggling window
+    const winStart    = contacts[0].time;
+    const winEnd      = contacts[contacts.length - 1].time;
+    const winDuration = Math.max(winEnd - winStart, 0.1);
+    const detectedInWindow = cleaned.filter(p => p.t >= winStart && p.t <= winEnd).length;
+    const expectedInWindow = Math.round(winDuration * TARGET_FPS);
+    const trackingScore    = Math.min(1, detectedInWindow / Math.max(expectedInWindow, 1));
+
+    // C) Count bonus (saturates at 5)
+    const countBonus = Math.min(1, contacts.length / 5);
+
+    confidence = (rhythmScore * 0.50) + (trackingScore * 0.35) + (countBonus * 0.15);
     confidence = Math.min(0.97, Math.max(0.1, confidence));
   }
 
