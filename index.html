@@ -1061,6 +1061,7 @@ footer {
 
 <script>
 const API_URL = 'http://localhost:8000';
+const MAX_DURATION_SECONDS = 600;
 
 let mediaStream = null;
 let mediaRecorder = null;
@@ -1218,34 +1219,11 @@ async function runAnalyzingAnimation() {
 }
 
 async function simulateAnalysis(blob) {
-  /*
-   * HIGH-ACCURACY CV ENGINE — up to 60s analysis budget
-   *
-   * Strategy:
-   *   1. Seek-based sampling: seek to every 1/30s of video time (30 fps equivalent)
-   *      but cap total analysis wall-clock time at 60s.
-   *   2. For each frame: detect ball centroid using color config + blob filtering
-   *   3. Build full position trace at native video fps
-   *   4. 5-frame Gaussian smooth to kill jitter
-   *   5. Peak detection on smoothed dy signal:
-   *      - find local minima in y (= ball at lowest = foot contact)
-   *      - validate with minimum velocity threshold
-   *      - adaptive debounce based on median inter-contact interval
-   *   6. Streak detection with gap analysis
-   */
   showState('analyzing');
 
   const dur = sessionDuration || 5;
   const url = URL.createObjectURL(blob);
 
-  // ── Progress UI ───────────────────────────────────────────────
-  const STEP_LABELS = [
-    'scanning frames',
-    'tracking trajectory',
-    'smoothing signal',
-    'detecting contacts',
-    'scoring confidence'
-  ];
   function setStep(n, label) {
     for (let i = 1; i <= 5; i++) {
       const el = document.getElementById('pstep-' + i);
@@ -1259,7 +1237,6 @@ async function simulateAnalysis(blob) {
     }
   }
 
-  // Live counter shown on step 1
   function updateFrameCount(n, total) {
     const el = document.getElementById('pstep-1');
     if (el) el.querySelector('.pstep-dot').nextSibling.textContent =
@@ -1268,137 +1245,211 @@ async function simulateAnalysis(blob) {
 
   setStep(1);
 
-  // ── Load video ────────────────────────────────────────────────
+  const CW = 320, CH = 180;
   const vid = document.createElement('video');
-  vid.src = url;
-  vid.muted = true;
-  vid.preload = 'auto';
+  vid.src = url; vid.muted = true; vid.preload = 'auto';
   vid.style.cssText = 'position:fixed;opacity:0;pointer-events:none;width:1px;height:1px;top:0;left:0';
   document.body.appendChild(vid);
 
   const canvas = document.createElement('canvas');
-  canvas.width = 320; canvas.height = 180; // higher res than before for better centroid
+  canvas.width = CW; canvas.height = CH;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-  await new Promise(r => {
-    vid.onloadedmetadata = r;
-    vid.onerror = r;
-    setTimeout(r, 3000);
-  });
+  await new Promise(r => { vid.onloadedmetadata = r; vid.onerror = r; setTimeout(r, 3000); });
+
+  // ── Background model (first 3 frames, pre-juggling) ───────────
+  // Averaging multiple frames guards against compression artifacts.
+  const bgR = new Float32Array(CW * CH);
+  const bgG = new Float32Array(CW * CH);
+  const bgB = new Float32Array(CW * CH);
+  const BG_FRAMES = 3;
+  for (let bi = 0; bi < BG_FRAMES; bi++) {
+    vid.currentTime = bi * 0.1;
+    await new Promise(r => { vid.onseeked = r; setTimeout(r, 400); });
+    ctx.drawImage(vid, 0, 0, CW, CH);
+    const bd = ctx.getImageData(0, 0, CW, CH).data;
+    for (let pi = 0; pi < CW * CH; pi++) {
+      bgR[pi] += bd[pi * 4]     / BG_FRAMES;
+      bgG[pi] += bd[pi * 4 + 1] / BG_FRAMES;
+      bgB[pi] += bd[pi * 4 + 2] / BG_FRAMES;
+    }
+  }
 
   const videoDur = vid.duration || dur;
-
-  // ── Frame sampling plan ───────────────────────────────────────
-  // Sample at 30 fps equivalent but cap to 60s wall-clock budget.
-  // For a 10-min video: 18000 frames × ~3ms each = ~54s. Good.
-  const TARGET_FPS   = 30;
-  const BUDGET_MS    = 58000; // 58s budget, leaves 2s for post-processing
-  const totalFrames  = Math.round(videoDur * TARGET_FPS);
-  const msPerFrame   = BUDGET_MS / totalFrames;
-  // If each seek+draw takes longer than budget allows, we subsample
-  // (browsers are typically 5-15ms per seek on short vids, 15-40ms on long)
-  // We'll measure and adapt.
+  const TARGET_FPS  = 30;
+  const BUDGET_MS   = 55000;
+  const totalFrames = Math.round(videoDur * TARGET_FPS);
 
   const cfg = BALL_COLOR_CONFIG[selectedBallColor] || BALL_COLOR_CONFIG.white;
-  const positions = []; // { t, x, y, area } — one per sampled frame
+  const positions = [];
   let missedFrames = 0;
+  let lastPos = null; // { x, y } — last confirmed ball position
+
+  // Grid dimensions for blob detection (each cell ≈ 8×8 px)
+  const GCOLS = 40, GROWS = 23;
+  const CELL_W = CW / GCOLS, CELL_H = CH / GROWS;
+
+  const FG_THRESHOLD = 22; // min per-channel diff to consider a pixel foreground
+  const MIN_CELL_PIX = 3;  // min matching pixels for a cell to be "active"
 
   const t0Wall = performance.now();
 
   for (let fi = 0; fi < totalFrames; fi++) {
     const wallElapsed = performance.now() - t0Wall;
+    const framesLeft  = totalFrames - fi;
+    const budgetLeft  = BUDGET_MS - wallElapsed;
+    if (framesLeft > 0 && budgetLeft < framesLeft * 3) continue;
 
-    // Adaptive subsampling: if we're burning budget too fast, skip frames
-    const framesLeft = totalFrames - fi;
-    const budgetLeft = BUDGET_MS - wallElapsed;
-    if (framesLeft > 0 && budgetLeft < framesLeft * 3) {
-      // Skip this frame to stay within budget
-      continue;
-    }
-
-    const seekTime = fi / TARGET_FPS;
-    vid.currentTime = seekTime;
-
-    await new Promise(r => {
-      vid.onseeked = r;
-      setTimeout(r, 150); // max wait per frame
-    });
+    vid.currentTime = fi / TARGET_FPS;
+    await new Promise(r => { vid.onseeked = r; setTimeout(r, 150); });
 
     try {
-      ctx.drawImage(vid, 0, 0, 320, 180);
-      const d = ctx.getImageData(0, 0, 320, 180).data;
+      ctx.drawImage(vid, 0, 0, CW, CH);
+      const d = ctx.getImageData(0, 0, CW, CH).data;
 
-      let sx = 0, sy = 0, cnt = 0;
-      let minX = 320, maxX = 0, minY = 180, maxY = 0;
+      // ── Grid-cell ballot: count color+foreground matching pixels per cell ──
+      const cells = new Uint8Array(GCOLS * GROWS);
+      for (let pi = 0; pi < CW * CH; pi++) {
+        const r = d[pi * 4], g = d[pi * 4 + 1], b = d[pi * 4 + 2];
 
-      for (let i = 0; i < d.length; i += 4) {
-        if (cfg.check(d[i], d[i+1], d[i+2])) {
-          const px = (i >> 2) % 320;
-          const py = (i >> 2) / 320 | 0;
-          sx += px; sy += py; cnt++;
-          if (px < minX) minX = px;
-          if (px > maxX) maxX = px;
-          if (py < minY) minY = py;
-          if (py > maxY) maxY = py;
-        }
+        // Background subtraction: skip pixels that match background
+        const fgDiff = Math.abs(r - bgR[pi]) + Math.abs(g - bgG[pi]) + Math.abs(b - bgB[pi]);
+        if (fgDiff < FG_THRESHOLD) continue;
+
+        if (!cfg.check(r, g, b)) continue;
+
+        const px = pi % CW;
+        const py = (pi / CW) | 0;
+        const gc = (px / CELL_W) | 0;
+        const gr = (py / CELL_H) | 0;
+        cells[gr * GCOLS + gc]++;
       }
 
-      if (cnt > 12) {
-        // Compute apparent radius — filter out huge blobs (background, jersey)
-        const blobW = maxX - minX;
-        const blobH = maxY - minY;
-        const radius = (blobW + blobH) / 4;
-        if (radius < 60) { // ignore blobs larger than ~1/3 frame width
-          positions.push({ t: seekTime, x: sx/cnt, y: sy/cnt, area: cnt, radius });
-        } else {
-          missedFrames++;
+      // ── Connected-component blob finding on active cells ──────────────────
+      const active  = new Uint8Array(GCOLS * GROWS);
+      for (let i = 0; i < cells.length; i++) {
+        if (cells[i] >= MIN_CELL_PIX) active[i] = 1;
+      }
+
+      const visited = new Uint8Array(GCOLS * GROWS);
+      const blobs   = [];
+
+      for (let i = 0; i < active.length; i++) {
+        if (!active[i] || visited[i]) continue;
+
+        // BFS flood-fill
+        const queue     = [i];
+        visited[i]      = 1;
+        const blobCells = [i];
+
+        while (queue.length) {
+          const curr = queue.shift();
+          const cr = (curr / GCOLS) | 0;
+          const cc =  curr % GCOLS;
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              if (dr === 0 && dc === 0) continue;
+              const nr = cr + dr, nc = cc + dc;
+              if (nr < 0 || nr >= GROWS || nc < 0 || nc >= GCOLS) continue;
+              const ni = nr * GCOLS + nc;
+              if (!active[ni] || visited[ni]) continue;
+              visited[ni] = 1;
+              queue.push(ni);
+              blobCells.push(ni);
+            }
+          }
         }
+
+        // Blob geometry
+        let minC = GCOLS, maxC = 0, minR = GROWS, maxR = 0;
+        let sumC = 0, sumR = 0;
+        for (const c of blobCells) {
+          const cr = (c / GCOLS) | 0, cc = c % GCOLS;
+          if (cr < minR) minR = cr; if (cr > maxR) maxR = cr;
+          if (cc < minC) minC = cc; if (cc > maxC) maxC = cc;
+          sumC += cc; sumR += cr;
+        }
+
+        const blobW = (maxC - minC + 1) * CELL_W;
+        const blobH = (maxR - minR + 1) * CELL_H;
+        const radius      = (blobW + blobH) / 4;
+        const aspectRatio = Math.max(blobW, blobH) / Math.max(Math.min(blobW, blobH), 1);
+        const cx = (sumC / blobCells.length + 0.5) * CELL_W;
+        const cy = (sumR / blobCells.length + 0.5) * CELL_H;
+        blobs.push({ cx, cy, radius, cellCount: blobCells.length, aspectRatio });
+      }
+
+      // ── Score blobs and pick the best candidate ───────────────────────────
+      // Prefer: ball-sized radius (4–50 px), circular, near last known position.
+      const IDEAL_RADIUS = 14;
+      const scored = blobs
+        .filter(b => b.radius >= 4 && b.radius <= 55 && b.aspectRatio < 2.8)
+        .map(b => {
+          let score = 0;
+          // Size fit (±50% of ideal = full points)
+          score += Math.max(0, 1 - Math.abs(b.radius - IDEAL_RADIUS) / IDEAL_RADIUS) * 40;
+          // Circularity
+          score += Math.max(0, (2.8 - b.aspectRatio) / 1.8) * 30;
+          // Temporal consistency
+          if (lastPos) {
+            const dist = Math.hypot(b.cx - lastPos.x, b.cy - lastPos.y);
+            score += Math.max(0, (160 - dist) / 160) * 30;
+          } else {
+            score += 15;
+          }
+          return { ...b, score };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      if (scored.length > 0) {
+        const best = scored[0];
+        positions.push({ t: fi / TARGET_FPS, x: best.cx, y: best.cy, radius: best.radius });
+        lastPos = { x: best.cx, y: best.cy };
       } else {
         missedFrames++;
+        // Reset tracker if ball lost for > 1 s to avoid wrong temporal bias
+        if (lastPos && positions.length > 0) {
+          const lastT = positions[positions.length - 1].t;
+          if ((fi / TARGET_FPS) - lastT > 1.0) lastPos = null;
+        }
       }
     } catch(e) { missedFrames++; }
 
-    // Update live counter every 30 frames
     if (fi % 30 === 0) {
       updateFrameCount(positions.length, fi + 1);
-      await sleep(0); // yield to browser so UI updates
+      await sleep(0);
     }
   }
 
   vid.remove();
   URL.revokeObjectURL(url);
-
   const wallTotal = ((performance.now() - t0Wall) / 1000).toFixed(1);
-  const detectionRate = positions.length / Math.max(totalFrames - missedFrames, 1);
 
-  // ── Step 2: trajectory cleaning ──────────────────────────────
+  // ── Step 2: outlier removal ───────────────────────────────────
   setStep(2, 'tracking trajectory');
   await sleep(0);
 
-  // Remove outlier jumps (ball teleportation = detection error)
   const cleaned = [];
   for (let i = 0; i < positions.length; i++) {
     if (i === 0 || i === positions.length - 1) { cleaned.push(positions[i]); continue; }
-    const prev = positions[i-1];
-    const curr = positions[i];
-    const dist = Math.hypot(curr.x - prev.x, curr.y - prev.y);
-    const dt   = Math.max(curr.t - prev.t, 0.001);
-    const speed = dist / dt; // pixels per second
-    // A real ball shouldn't teleport more than ~300px/s at 320px wide canvas
-    if (speed < 400) cleaned.push(curr);
+    const prev = positions[i - 1], curr = positions[i];
+    const dist  = Math.hypot(curr.x - prev.x, curr.y - prev.y);
+    const dt    = Math.max(curr.t - prev.t, 0.001);
+    if (dist / dt < 450) cleaned.push(curr); // drop teleportation jumps
   }
 
-  // ── Step 3: 5-frame Gaussian smooth on Y ─────────────────────
+  // ── Step 3: 7-tap Gaussian smooth on Y ───────────────────────
   setStep(3, 'smoothing signal');
   await sleep(0);
 
-  const GAUSS = [0.06, 0.24, 0.40, 0.24, 0.06]; // 5-tap Gaussian kernel
+  // Wider kernel than before for cleaner velocity signal
+  const GAUSS7 = [0.03, 0.10, 0.22, 0.30, 0.22, 0.10, 0.03];
   const smoothed = cleaned.map((p, i) => {
     let sy = 0, sw = 0;
-    for (let k = -2; k <= 2; k++) {
+    for (let k = -3; k <= 3; k++) {
       const idx = i + k;
       if (idx >= 0 && idx < cleaned.length) {
-        const w = GAUSS[k + 2];
+        const w = GAUSS7[k + 3];
         sy += cleaned[idx].y * w;
         sw += w;
       }
@@ -1411,52 +1462,56 @@ async function simulateAnalysis(blob) {
   await sleep(0);
 
   /*
-   * Contact detection method:
-   *   - Compute velocity dy/dt between consecutive smoothed points
-   *   - A contact occurs at a LOCAL MINIMUM in y (ball at lowest point = foot touch)
-   *   - Require: dy goes from positive (falling) to negative (rising)
-   *   - Require: magnitude of velocity change > MIN_VELOCITY (not just noise)
-   *   - Adaptive debounce: min gap = 0.2s (physically impossible to juggle faster)
+   * Contact = ball reverses from falling (vy > 0) to rising (vy < 0).
+   * Requirements for a valid contact:
+   *   1. vy crosses from positive to negative (zero-crossing).
+   *   2. Minimum velocity magnitude on each side ≥ MIN_VELOCITY px/s.
+   *      (fixes original bug where MIN_VELOCITY=0.8 px/s let any noise through)
+   *   3. Arc consistency: at least 2 consecutive frames of sustained falling
+   *      before the crossing and 2 of sustained rising after it.
+   *   4. Debounce: at least MIN_CONTACT_GAP seconds since last contact.
    */
-  const MIN_VELOCITY    = 0.8;  // px per frame at canvas scale
-  const MIN_CONTACT_GAP = 0.20; // seconds — minimum time between juggles
+  const MIN_VELOCITY    = 35;   // px/s — meaningful motion, not measurement noise
+  const MIN_CONTACT_GAP = 0.22; // seconds
 
-  // Compute velocities
   const vels = [];
   for (let i = 1; i < smoothed.length; i++) {
-    const dt = smoothed[i].t - smoothed[i-1].t;
-    const dy = smoothed[i].y - smoothed[i-1].y;
+    const dt = smoothed[i].t - smoothed[i - 1].t;
+    const dy = smoothed[i].y - smoothed[i - 1].y;
     vels.push({ t: smoothed[i].t, vy: dt > 0 ? dy / dt : 0 });
   }
 
-  // Find zero-crossings where ball transitions from falling (vy>0) to rising (vy<0)
   const contacts = [];
-  let lastContactT = -1;
+  let lastContactT  = -1;
   let currentStreak = 0;
-  let bestStreak = 0;
-  let streakGapThreshold = 0.8; // seconds — gap longer than this = drop
+  let bestStreak    = 0;
+  const STREAK_GAP  = 0.9; // seconds without contact = drop
 
   for (let i = 1; i < vels.length; i++) {
-    const prev = vels[i-1];
+    const prev = vels[i - 1];
     const curr = vels[i];
 
-    // Zero crossing: was falling, now rising
-    if (prev.vy > MIN_VELOCITY && curr.vy < -MIN_VELOCITY) {
-      const contactT = curr.t;
+    if (!(prev.vy > MIN_VELOCITY && curr.vy < -MIN_VELOCITY)) continue;
 
-      // Debounce
-      if (contactT - lastContactT < MIN_CONTACT_GAP) continue;
+    // Arc consistency: require sustained motion each side
+    const lookBack  = Math.min(i - 1, 2);
+    const lookAhead = Math.min(vels.length - 1 - i, 2);
+    let fallingOk = true, risingOk = true;
+    for (let k = 1; k <= lookBack;  k++) if (vels[i - 1 - k].vy < 0) { fallingOk = false; break; }
+    for (let k = 1; k <= lookAhead; k++) if (vels[i + k].vy     > 0) { risingOk  = false; break; }
+    if (!fallingOk || !risingOk) continue;
 
-      // Check for streak break (long gap = drop)
-      if (lastContactT > 0 && contactT - lastContactT > streakGapThreshold) {
-        bestStreak = Math.max(bestStreak, currentStreak);
-        currentStreak = 0;
-      }
+    const contactT = curr.t;
+    if (contactT - lastContactT < MIN_CONTACT_GAP) continue;
 
-      contacts.push({ time: Math.round(contactT * 100) / 100, type: 'foot' });
-      currentStreak++;
-      lastContactT = contactT;
+    if (lastContactT > 0 && contactT - lastContactT > STREAK_GAP) {
+      bestStreak = Math.max(bestStreak, currentStreak);
+      currentStreak = 0;
     }
+
+    contacts.push({ time: Math.round(contactT * 100) / 100, type: 'foot' });
+    currentStreak++;
+    lastContactT = contactT;
   }
   bestStreak = Math.max(bestStreak, currentStreak);
 
@@ -1464,12 +1519,11 @@ async function simulateAnalysis(blob) {
   setStep(5, 'scoring confidence');
   await sleep(200);
 
-  const trackedPct  = cleaned.length / Math.max(totalFrames, 1);
-  const hasSignal   = smoothed.length > 5;
-  const velVariance = vels.length > 0
-    ? vels.reduce((s,v) => s + v.vy*v.vy, 0) / vels.length
-    : 0;
-  const signalQuality = Math.min(1, velVariance / 500);
+  const trackedPct   = cleaned.length / Math.max(totalFrames, 1);
+  const hasSignal    = smoothed.length > 5;
+  const velVariance  = vels.length > 0
+    ? vels.reduce((s, v) => s + v.vy * v.vy, 0) / vels.length : 0;
+  const signalQuality = Math.min(1, velVariance / 8000); // recalibrated for new MIN_VELOCITY scale
 
   let confidence = 0;
   if (hasSignal) {
@@ -1478,21 +1532,21 @@ async function simulateAnalysis(blob) {
   }
 
   [1,2,3,4,5].forEach(i => {
-    document.getElementById('pstep-'+i).classList.remove('active');
-    document.getElementById('pstep-'+i).classList.add('done');
+    document.getElementById('pstep-' + i).classList.remove('active');
+    document.getElementById('pstep-' + i).classList.add('done');
   });
   await sleep(300);
 
   showResults({
-    total_juggles: contacts.length,
-    best_streak:   bestStreak,
+    total_juggles:    contacts.length,
+    best_streak:      bestStreak,
     contacts,
     confidence_score: Math.round(confidence * 100) / 100,
     _meta: {
       processing_time: wallTotal,
-      request_id: 'cv-' + Date.now().toString(36),
-      frames_sampled: cleaned.length,
-      detection_rate: Math.round(trackedPct * 100) + '%'
+      request_id:      'cv-' + Date.now().toString(36),
+      frames_sampled:  cleaned.length,
+      detection_rate:  Math.round(trackedPct * 100) + '%'
     },
     low_confidence: confidence < 0.35 || contacts.length === 0
   }, dur);
