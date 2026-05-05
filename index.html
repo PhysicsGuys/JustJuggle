@@ -897,7 +897,7 @@ footer {
       <div class="processing-card">
         <div class="spinner"></div>
         <div class="processing-title">Analyzing...</div>
-        <div class="processing-sub">CV pipeline running — up to 60s for best accuracy</div>
+        <div class="processing-sub" id="analyzing-sub">CV pipeline running — analyzing every frame</div>
         <div class="progress-steps">
           <div class="pstep active" id="pstep-1"><div class="pstep-dot"></div> scanning frames</div>
           <div class="pstep" id="pstep-2"><div class="pstep-dot"></div> tracking trajectory</div>
@@ -1275,7 +1275,13 @@ async function simulateAnalysis(blob) {
     }
   }
 
-  const videoDur = vid.duration || dur;
+  // WebM files recorded via MediaRecorder almost always report duration=Infinity
+  // because the container header doesn't get a duration written to it.
+  // Use sessionDuration (the wall-clock time we measured while recording) as the
+  // source of truth. Only fall back to vid.duration if it's a real finite number.
+  const videoDur = (isFinite(vid.duration) && vid.duration > 0)
+    ? vid.duration
+    : (sessionDuration || dur || 10);
   const TARGET_FPS  = 30;
   const totalFrames = Math.round(videoDur * TARGET_FPS);
 
