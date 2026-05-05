@@ -903,7 +903,7 @@ footer {
           <div class="pstep" id="pstep-2"><div class="pstep-dot"></div> tracking trajectory</div>
           <div class="pstep" id="pstep-3"><div class="pstep-dot"></div> smoothing signal</div>
           <div class="pstep" id="pstep-4"><div class="pstep-dot"></div> detecting contacts</div>
-          <div class="pstep" id="pstep-5"><div class="pstep-dot"></div> scoring confidence</div>
+          <div class="pstep" id="pstep-5"><div class="pstep-dot"></div> verifying contacts</div>
         </div>
       </div>
     </div>
@@ -1277,7 +1277,6 @@ async function simulateAnalysis(blob) {
 
   const videoDur = vid.duration || dur;
   const TARGET_FPS  = 30;
-  const BUDGET_MS   = 55000;
   const totalFrames = Math.round(videoDur * TARGET_FPS);
 
   const cfg = BALL_COLOR_CONFIG[selectedBallColor] || BALL_COLOR_CONFIG.white;
@@ -1296,10 +1295,6 @@ async function simulateAnalysis(blob) {
   let lastYield = performance.now(); // track last time we yielded to the browser
 
   for (let fi = 0; fi < totalFrames; fi++) {
-    const wallElapsed = performance.now() - t0Wall;
-    const framesLeft  = totalFrames - fi;
-    const budgetLeft  = BUDGET_MS - wallElapsed;
-    if (framesLeft > 0 && budgetLeft < framesLeft * 3) continue;
 
     vid.currentTime = fi / TARGET_FPS;
     await new Promise(r => { vid.onseeked = r; setTimeout(r, 150); });
@@ -1520,9 +1515,82 @@ async function simulateAnalysis(blob) {
   }
   bestStreak = Math.max(bestStreak, currentStreak);
 
-  // ── Step 5: confidence scoring ────────────────────────────────
-  setStep(5, 'scoring confidence');
-  await sleep(200);
+  // ── Step 5: verification pass + confidence scoring ────────────
+  setStep(5, 'verifying contacts');
+  await sleep(100);
+
+  /*
+   * Double-check every detected contact by re-scanning 5 frames around
+   * its timestamp (±2 frames at the sampled fps). For each check frame,
+   * look for ball-colored foreground pixels inside a 70×70px ROI centred
+   * on the nearest trajectory position. A contact is kept only if the ball
+   * is confirmed in at least 2 of the 5 check frames.
+   *
+   * This eliminates contacts triggered by a momentary signal artefact
+   * where the ball was never actually detected near that position.
+   */
+  const verified = [];
+  for (let ci = 0; ci < contacts.length; ci++) {
+    const contact  = contacts[ci];
+    const checkDts = [-0.10, -0.05, 0, 0.05, 0.10];
+    let foundCount = 0;
+
+    // Find the closest trajectory point to use as expected ball position
+    let nearestPos = cleaned[0];
+    let nearestDt  = Infinity;
+    for (const p of cleaned) {
+      const dt = Math.abs(p.t - contact.time);
+      if (dt < nearestDt) { nearestDt = dt; nearestPos = p; }
+    }
+
+    if (!nearestPos) { verified.push(contact); continue; } // no trajectory = can't verify, keep it
+
+    for (const dt of checkDts) {
+      const t = Math.max(0, Math.min(videoDur, contact.time + dt));
+      vid.currentTime = t;
+      await new Promise(r => { vid.onseeked = r; setTimeout(r, 150); });
+
+      try {
+        ctx.drawImage(vid, 0, 0, CW, CH);
+        const d = ctx.getImageData(0, 0, CW, CH).data;
+
+        // ROI: 70×70 px window around expected ball position
+        const roiX = Math.max(0, Math.round(nearestPos.x - 35));
+        const roiY = Math.max(0, Math.round(nearestPos.y - 35));
+        const roiW = Math.min(CW - roiX, 70);
+        const roiH = Math.min(CH - roiY, 70);
+
+        let matchCount = 0;
+        for (let py = roiY; py < roiY + roiH; py++) {
+          for (let px = roiX; px < roiX + roiW; px++) {
+            const pi = py * CW + px;
+            const r  = d[pi * 4], g = d[pi * 4 + 1], b = d[pi * 4 + 2];
+            const fgDiff = Math.abs(r - bgR[pi]) + Math.abs(g - bgG[pi]) + Math.abs(b - bgB[pi]);
+            if (fgDiff >= FG_THRESHOLD && cfg.check(r, g, b)) matchCount++;
+          }
+        }
+        if (matchCount >= 8) foundCount++;
+      } catch(e) { /* skip bad frame */ }
+    }
+
+    if (foundCount >= 2) verified.push(contact); // confirmed — keep
+    // else: ball not found around this timestamp — drop it
+
+    // Yield every few contacts so the UI stays live during verification
+    if (ci % 3 === 0) await sleep(0);
+  }
+
+  // Recompute streak on verified contacts
+  let verifiedStreak = 0, verifiedBest = 0, lastVerT = -1;
+  for (const c of verified) {
+    if (lastVerT > 0 && c.time - lastVerT > STREAK_GAP) {
+      verifiedBest = Math.max(verifiedBest, verifiedStreak);
+      verifiedStreak = 0;
+    }
+    verifiedStreak++;
+    lastVerT = c.time;
+  }
+  verifiedBest = Math.max(verifiedBest, verifiedStreak);
 
   /*
    * Confidence = how likely the detected contacts are real juggles.
@@ -1542,33 +1610,35 @@ async function simulateAnalysis(blob) {
    */
   let confidence = 0;
 
-  if (contacts.length === 0) {
+  if (verified.length === 0) {
     confidence = 0.05;
-  } else if (contacts.length === 1) {
+  } else if (verified.length === 1) {
     confidence = 0.25;
   } else {
-    // A) Rhythm regularity
+    // A) Rhythm regularity (verified contacts only)
     const gaps = [];
-    for (let i = 1; i < contacts.length; i++)
-      gaps.push(contacts[i].time - contacts[i - 1].time);
+    for (let i = 1; i < verified.length; i++)
+      gaps.push(verified[i].time - verified[i - 1].time);
     const meanGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
     const stdGap  = Math.sqrt(gaps.reduce((s, g) => s + (g - meanGap) ** 2, 0) / gaps.length);
     const cv      = meanGap > 0 ? stdGap / meanGap : 1;
-    // CV < 0.15 = very regular (metronome), CV > 0.6 = erratic
     const rhythmScore = Math.max(0, Math.min(1, 1 - (cv / 0.6)));
 
     // B) Tracking in active juggling window
-    const winStart    = contacts[0].time;
-    const winEnd      = contacts[contacts.length - 1].time;
+    const winStart    = verified[0].time;
+    const winEnd      = verified[verified.length - 1].time;
     const winDuration = Math.max(winEnd - winStart, 0.1);
     const detectedInWindow = cleaned.filter(p => p.t >= winStart && p.t <= winEnd).length;
     const expectedInWindow = Math.round(winDuration * TARGET_FPS);
     const trackingScore    = Math.min(1, detectedInWindow / Math.max(expectedInWindow, 1));
 
-    // C) Count bonus (saturates at 5)
-    const countBonus = Math.min(1, contacts.length / 5);
+    // C) Verification pass ratio: how many raw contacts survived verification
+    const verifyRatio = contacts.length > 0 ? verified.length / contacts.length : 0;
 
-    confidence = (rhythmScore * 0.50) + (trackingScore * 0.35) + (countBonus * 0.15);
+    // D) Count bonus (saturates at 5)
+    const countBonus = Math.min(1, verified.length / 5);
+
+    confidence = (rhythmScore * 0.40) + (trackingScore * 0.25) + (verifyRatio * 0.20) + (countBonus * 0.15);
     confidence = Math.min(0.97, Math.max(0.1, confidence));
   }
 
@@ -1579,17 +1649,18 @@ async function simulateAnalysis(blob) {
   await sleep(300);
 
   showResults({
-    total_juggles:    contacts.length,
-    best_streak:      bestStreak,
-    contacts,
+    total_juggles:    verified.length,
+    best_streak:      verifiedBest,
+    contacts:         verified,
     confidence_score: Math.round(confidence * 100) / 100,
     _meta: {
-      processing_time: wallTotal,
-      request_id:      'cv-' + Date.now().toString(36),
-      frames_sampled:  cleaned.length,
-      detection_rate:  Math.round(trackedPct * 100) + '%'
+      processing_time:  wallTotal,
+      request_id:       'cv-' + Date.now().toString(36),
+      frames_sampled:   cleaned.length,
+      raw_contacts:     contacts.length,
+      verified_contacts: verified.length
     },
-    low_confidence: confidence < 0.35 || contacts.length === 0
+    low_confidence: confidence < 0.35 || verified.length === 0
   }, dur);
 }
 
