@@ -1293,6 +1293,7 @@ async function simulateAnalysis(blob) {
   const MIN_CELL_PIX = 3;  // min matching pixels for a cell to be "active"
 
   const t0Wall = performance.now();
+  let lastYield = performance.now(); // track last time we yielded to the browser
 
   for (let fi = 0; fi < totalFrames; fi++) {
     const wallElapsed = performance.now() - t0Wall;
@@ -1337,13 +1338,14 @@ async function simulateAnalysis(blob) {
       for (let i = 0; i < active.length; i++) {
         if (!active[i] || visited[i]) continue;
 
-        // BFS flood-fill
+        // BFS flood-fill — use index pointer (O(1)) instead of shift() (O(n))
         const queue     = [i];
+        let   qHead     = 0;
         visited[i]      = 1;
         const blobCells = [i];
 
-        while (queue.length) {
-          const curr = queue.shift();
+        while (qHead < queue.length) {
+          const curr = queue[qHead++];
           const cr = (curr / GCOLS) | 0;
           const cc =  curr % GCOLS;
           for (let dr = -1; dr <= 1; dr++) {
@@ -1415,9 +1417,12 @@ async function simulateAnalysis(blob) {
       }
     } catch(e) { missedFrames++; }
 
-    if (fi % 30 === 0) {
+    // Yield to browser every 50ms so the page stays responsive.
+    // Wall-clock based so fast seeks don't starve the UI, slow seeks don't over-yield.
+    if (performance.now() - lastYield > 50) {
       updateFrameCount(positions.length, fi + 1);
       await sleep(0);
+      lastYield = performance.now();
     }
   }
 
